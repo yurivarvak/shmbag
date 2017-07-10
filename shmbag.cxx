@@ -425,7 +425,13 @@ struct shmbag_mgr
     assert(id_to_addr.find(id) == id_to_addr.end());
 
     shmblock *newblock = get_blk_w_addr(0, blocks.size()); // find free slot
-    assert(newblock);  // TODO: fix - no available slots
+	if (!newblock)  // no available slots
+	{
+	  if (!extend_table_cap())  // can't extend - not possible to alloc
+	    return 0;
+	  newblock = get_blk_w_addr(0, blocks.size());
+	  assert(newblock);
+	}
     newblock->id = id;
     newblock->address = get_free_space_addr();
     newblock->capacity = s2p(size + sizeof(shmblock_header));
@@ -540,6 +546,45 @@ struct shmbag_mgr
   {
     assert(control_table);
     return ((control_header *)control_table->get_address())->table_cap;
+  }
+  
+  bool extend_table_cap()
+  {
+    auto first_blk = blocks.begin();
+	if (first_blk->address == 0 ||
+	    inflight_items.find(first_blk->address) != inflight_items.end())
+	  return false;
+
+	page_t free_addr = get_free_space_addr();
+	
+	if (device.psize < free_addr + first_blk->capacity) // need to grow shmem file
+      if (!device.grow(p2s(free_addr + first_blk->capacity - device.psize)))
+	    return false;
+	
+	int old_cap = control_table_cap();
+	int new_cap = old_cap + (int)(p2s(first_blk->capacity) / sizeof(shmblock));
+
+    shfile_ptr shf = device.get_file();
+	delete control_table;
+	control_table = new mapped_region(*shf->file, read_write, 0, p2s(first_blk->address + first_blk->capacity));
+	mapped_region copy(*shf->file, read_write, p2s(free_addr), p2s(first_blk->capacity));
+	shmblock *old_blk = (shmblock *)((char *)control_table->get_address() + p2s(first_blk->address));
+	shmblock *new_blk = (shmblock *)copy.get_address();
+	memcpy(new_blk, old_blk, p2s(first_blk->capacity));
+	memset(old_blk, 0, p2s(first_blk->capacity));
+	
+	shmblock *blk_slot = get_blk_w_addr(first_blk->address, 0);
+	assert(blk_slot);
+	blk_slot->address = new_blk->address = free_addr;
+	
+	blocks.erase(first_blk);
+	blocks.insert(*new_blk);
+	if (!btkUniIdIsNull(&new_blk->id)) // if id is not null - update index
+      id_to_addr[new_blk->id] = new_blk->address;
+    
+	((control_header *)control_table->get_address())->table_cap = new_cap;
+	
+	return true;
   }
 
   shmblock *get_blks()
