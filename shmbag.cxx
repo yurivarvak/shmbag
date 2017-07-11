@@ -230,7 +230,7 @@ private:
 
 struct shfile_ref
 {
-  shfile_ref(file_mapping *f, mutex *m) : file(f), mux(m) { mux->lock(); }
+  shfile_ref(file_mapping *f, mutex *m) : file(f), mux(m) {}
   ~shfile_ref() { mux->unlock(); }
   file_mapping *file;
 private:
@@ -243,7 +243,7 @@ struct shmdevice
 {
   string mapped_file;
   page_t psize;
-  shmdevice(const char *path) : mapped_file(path), psize(0)
+  shmdevice(const char *path) : mapped_file(path), psize(0), file(0)
   {
     fstream f(mapped_file, ios::out | ios::binary | ios::in);
     if (!f.fail())
@@ -251,10 +251,8 @@ struct shmdevice
       f.seekp(0, ios::end);
       psize = (page_t)(f.tellp() / PAGESIZE);
       f.close();
+	  file = new file_mapping(mapped_file.c_str(), read_write);
     }
-    try {
-      file = new file_mapping(mapped_file.c_str(), read_write);
-    } catch(...) { file = 0; }
   }
 
   ~shmdevice() { delete file; }
@@ -295,6 +293,7 @@ struct shmdevice
 
   shfile_ptr get_file()
   {
+    file_mux.lock();
     if (!file)
       file = new file_mapping(mapped_file.c_str(), read_write);
     return make_shared<shfile_ref>(file, &file_mux);
@@ -460,12 +459,21 @@ struct shmbag_mgr
 	  newblock = get_blk_w_addr(0, blocks.size());
 	  assert(newblock);
 	}
+	
+	page_t fs_addr = get_free_space_addr();
+	page_t min_cap = (size > 0) ? s2p(size + sizeof(shmblock_header)) : 1;
+	page_t av_cap = device.psize - fs_addr;
+	
+	if (av_cap < min_cap) // need to grow shmem file
+	  if (!device.grow(p2s(min_cap - av_cap)))
+	    return 0;
+	
+	page_t des_cap = av_cap / 3;
+	page_t cap = (size > 0 || min_cap > des_cap) ? min_cap : des_cap;
+	
     newblock->id = id;
-    newblock->address = get_free_space_addr();
-    newblock->capacity = s2p(size + sizeof(shmblock_header));
-
-    if (device.psize < newblock->address + newblock->capacity) // need to grow shmem file
-      device.grow(p2s(newblock->address + newblock->capacity - device.psize));
+    newblock->address = fs_addr;
+    newblock->capacity = cap;
 
     // update block header
     init_block_header(newblock->address, newblock->id, newblock->capacity, 0);
@@ -571,8 +579,8 @@ struct shmbag_mgr
 	if (inflight_items.find(addr) == inflight_items.end()) // last reference
 	{
 	  shmblock *blk = get_blk_w_addr(addr);
-	  if (blk)
-	  {
+	  if (blk)  // if not - address not longer valid 
+	  { // truncate capacity to match the size
 	    shfile_ptr shf = device.get_file();
 	    mapped_region h(*shf->file, read_write, addr, sizeof(shmblock_header));
 	    shmblock_header *hdr = (shmblock_header *)h.get_address();
@@ -762,8 +770,8 @@ struct shmbag_mgr
 	}
 	assert(est_free >= 0);
 	int ratio = est_free ? total / est_free : 1000;
-	if (ratio > 10 || (total < desired_size && ratio > 4))  // loads of 90% or 75%
-	  device.grow(64 * MB);
+	if (ratio > 10 || (total < desired_size && inflight_items.empty() && ratio > 4))  // loads of 90% or 75%
+	  device.grow(1 * MB);
   }
 
   // make a request to service thread
