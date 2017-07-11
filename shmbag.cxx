@@ -568,6 +568,20 @@ struct shmbag_mgr
     auto i = inflight_items.find(addr);
     assert(i != inflight_items.end());
     inflight_items.erase(i);
+	if (inflight_items.find(addr) == inflight_items.end()) // last reference
+	{
+	  shmblock *blk = get_blk_w_addr(addr);
+	  if (blk)
+	  {
+	    shfile_ptr shf = device.get_file();
+	    mapped_region h(*shf->file, read_write, addr, sizeof(shmblock_header));
+	    shmblock_header *hdr = (shmblock_header *)h.get_address();
+	    page_t new_cap = s2p(hdr->size + sizeof(shmblock_header));
+	    assert(hdr->capacity >= new_cap);
+	    if (hdr->capacity > new_cap)
+		  blk->capacity = hdr->capacity = new_cap;
+	  }
+	}
   }
 
   int control_table_cap()
@@ -877,7 +891,9 @@ int shmbag_mgr_item_realloc(shmbag_mgr_t mgr, shmbag_item_t item, int64_t new_si
     else if (old_addr != new_addr)
     { // reallocation was done - need to update item
       item->close();
-      mgr->unlink_item(old_addr);
+	  auto i = mgr->inflight_items.find(old_addr);
+      assert(i != mgr->inflight_items.end());
+      mgr->inflight_items.erase(i);
       mgr->inflight_items.insert(new_addr);
       item->address = new_addr;
     }

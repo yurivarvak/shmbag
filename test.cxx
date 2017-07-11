@@ -72,8 +72,9 @@ void large_test()
   for (int i = 0; i < num_blocks; i++)
   {
     string s = get_uuid(i);
-    shmbag_item_t item = shmbag_mgr_item_acquire_or_alloc(mgr, s.c_str(), 1); assert(item);
-    int ret = shmbag_item_free(item); assert(ret == 0);
+    shmbag_item_t item = shmbag_mgr_item_acquire_or_alloc(mgr, s.c_str(), 100); assert(item);
+	int ret = shmbag_item_append(item, s.size() + 1, s.c_str()); assert(ret == s.size() + 1);
+    ret = shmbag_item_free(item); assert(ret == 0);
   }
   auto mid = chrono::system_clock::now();
   chrono::duration<double> elapsed_seconds = mid - start;
@@ -83,6 +84,7 @@ void large_test()
     string s = get_uuid(i);
     shmbag_item_t item = shmbag_mgr_item_acquire(mgr, s.c_str()); assert(item);
     int ret = shmbag_mgr_item_realloc(mgr, item, num_blocks - i + 1); assert(ret == 0);
+	assert(!strcmp(shmbag_item_get_ptr(item), s.c_str()));
     //shmbag_item_t item2 = shmbag_item_get(fname, shmbag_item_get_offset(item)); assert(item);
     //ret = shmbag_item_free(item2); assert(ret == 0);
     ret = shmbag_item_free(item); assert(ret == 0);
