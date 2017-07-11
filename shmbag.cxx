@@ -87,7 +87,7 @@ using namespace boost::interprocess;
 
 typedef unsigned page_t;
 
-#define PAGESIZE (mapped_region::get_page_size())
+#define PAGESIZE 512 //(mapped_region::get_page_size())
 
 static page_t s2p(int64_t size)
 {
@@ -327,7 +327,7 @@ struct control_header
 
 static unsigned initial_bag_block_capacity()
 {
-  return 16 * 1024;  // enough capacity for 16K blocks
+  return 2 * 1024;  // enough capacity for 16K blocks
 }
 static page_t initial_bag_size()
 {
@@ -417,6 +417,34 @@ struct shmbag_mgr
     assert(service.get_id() == this_thread::get_id());
     auto i = id_to_addr.find(id);
     return i == id_to_addr.end() ? 0 : construct_item(i->second);
+  }
+  
+  page_t move_block(page_t source, page_t target)
+  {
+    assert(source && target);
+	if (source == target)
+	  return 0;
+	
+	shmblock query = { NULL_UNIID_T, source, 0 };
+    auto blk = blocks.find(query);
+    assert(blk != blocks.end());
+    shmblock *shmblk = get_blk_w_addr(source, distance(blocks.begin(), blk));
+	assert(shmblk);
+	
+	shfile_ptr shf = device.get_file();
+	mapped_region src(*shf->file, read_write, p2s(source), p2s(shmblk->capacity));
+	mapped_region tgt(*shf->file, read_write, p2s(target), p2s(shmblk->capacity));
+	memmove(tgt.get_address(), src.get_address(), p2s(shmblk->capacity));
+	memset(src.get_address(), 0, sizeof(shmblock_header));
+	
+	shmblk->address = ((shmblock *)tgt.get_address())->address = target;  // update address
+	
+	blocks.erase(blk);
+	blocks.insert(*shmblk);
+	if (!btkUniIdIsNull(&shmblk->id)) // if id is not null - update index
+      id_to_addr[shmblk->id] = shmblk->address;
+  
+    return shmblk->capacity;
   }
 
   page_t alloc(const UniIdT &id, int64_t size)
@@ -593,8 +621,17 @@ struct shmbag_mgr
     return (shmblock *)((control_header *)control_table->get_address() + 1);
   }
 
-  shmblock *get_blk_w_addr(page_t addr, int start_idx = 0)
+  shmblock *get_blk_w_addr(page_t addr, int start_idx = -1)
   {
+    if (start_idx < 0 && addr)
+	{
+      shmblock query = { NULL_UNIID_T, addr, 0 };
+      auto blk = blocks.find(query);
+      if (blk != blocks.end())
+	    return 0;
+	  start_idx = distance(blocks.begin(), blk);
+    }
+	
     start_idx = start_idx < 0 ? 0 : start_idx;
     int table_max = control_table_cap();
     int end_idx = table_max + start_idx;
@@ -630,6 +667,89 @@ struct shmbag_mgr
     mapped_region hdrreg(*shf->file, read_write, addr*PAGESIZE, sizeof(shmblock_header));
     memcpy(&header, hdrreg.get_address(), sizeof(shmblock_header));
     assert(header.address == addr);
+  }
+  
+  // maintenance stuff
+  unsigned maint_slot_idx;
+  void do_maint_slots()
+  {
+    if (blocks.empty())
+	  return;
+	  
+	if (control_table_cap() < blocks.size() * 2)  
+	{ // capacity to be double current num blocks
+	  extend_table_cap();
+	  return;
+	}
+	
+	maint_slot_idx = (maint_slot_idx < blocks.size()) ? maint_slot_idx : 0;
+	shmblock *next = 0;
+	for (int i = 0; i < 1024; i++)
+	{
+	  shmblock *cur = get_blks() + maint_slot_idx;
+	  if (maint_slot_idx < blocks.size() - 1 || !cur->address)
+	  { // there is at least one more used slot
+	    if (!next || next == cur)
+	      next = cur + 1;
+	    while (!next->address) next++;  // find next used slot
+	  
+	    if (!cur->address || cur->address > next->address) 
+	      swap(*cur, *next);
+	  }
+      maint_slot_idx++;
+	  if (maint_slot_idx == blocks.size())
+	    break;
+	}
+  }
+  
+  page_t last_compact_addr;
+  void do_maint_blocks()
+  {
+    if (blocks.empty())
+	  return;
+	for (int i = 0; i < 1024; i++)
+	{
+	  auto blk = blocks.lower_bound({ NULL_UNIID_T, last_compact_addr, 0 });
+	  if (blk == blocks.end())
+	  {
+	    last_compact_addr = 0;
+	    break;
+  	  }
+	  last_compact_addr = blk->address;
+	  if (inflight_items.find(blk->address) == inflight_items.end())
+	  {
+	    page_t cap = blk->capacity;
+	    if (blk == blocks.begin()) // first item
+		  i += move_block(last_compact_addr, s2p((int64_t)control_table_cap() * sizeof(shmblock) + sizeof(control_header)));
+		else if (++blk != blocks.end())  // shift next item to the end of the current one
+		  i += move_block(blk->address, last_compact_addr + cap);
+	  }
+	}
+  }
+  
+  void do_maint_devsize()
+  {
+    if (blocks.empty() || get_free_space_addr())
+	  return;
+	  
+    const int64_t MB = 1024 * 1024;
+	const int64_t GB = 1024 * MB;
+    const int64_t desired_size = 4 * GB;
+	int64_t total = p2s(device.psize) - (control_table_cap() * sizeof(shmblock)) - sizeof(control_header);
+	int64_t est_free = total;
+	int num_blks = blocks.size();
+	if (num_blks < 100)  // calc used space
+	  for (auto b : blocks) est_free -= p2s(b.capacity);
+	else { // estimate free space
+	  est_free = 0;
+	  auto blk = blocks.rbegin();
+	  for (int i = 0; i < 20 && blk != blocks.rend(); i++, blk++)
+	    est_free += p2s(blk->capacity);
+	}
+	assert(est_free >= 0);
+	int ratio = est_free ? total / est_free : 1000;
+	if (ratio > 10 || (total < desired_size && ratio > 4))  // loads of 90% or 75%
+	  device.grow(64 * MB);
   }
 
   // make a request to service thread
@@ -672,9 +792,12 @@ static void mgr_service_loop(shmbag_mgr_t mgr)
 {
   mgr->running = true;
   unique_lock<mutex> mlock(mgr->mux);
+  bool timedout = false;
+  int maint_task = 0;
+  const int max_task = 2;
 while (mgr->running) {
-  auto ttw = chrono::milliseconds(1);
-  bool timedout = (mgr->signal.wait_for(mlock, ttw) == cv_status::timeout);
+  auto ttw = chrono::milliseconds(timedout ? 1 : 0);
+  timedout = (mgr->signal.wait_for(mlock, ttw) == cv_status::timeout);
   if (mgr->requests.empty() && !timedout) // spurious
     continue;
   while (!mgr->requests.empty()) // process pending requests
@@ -682,6 +805,13 @@ while (mgr->running) {
     auto req = mgr->requests.front();
     mgr->requests.pop();
     req();
+  }
+  switch (maint_task++)
+  {
+    case 0: mgr->do_maint_slots(); break;
+	case 1: mgr->do_maint_blocks(); break;
+	case 2: mgr->do_maint_devsize(); // fallthrough
+	default: maint_task = (maint_task < max_task) ? maint_task : 0;
   }
 }}
 

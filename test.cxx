@@ -66,7 +66,7 @@ void large_test()
 {
   cout << "\nLarge test:";
   const char *fname = "large.shmdata";
-  const int num_blocks = 100000;
+  const int num_blocks = 10000;
   auto start = chrono::system_clock::now();
   shmbag_mgr_t mgr = shmbag_mgr_open(fname, true); assert(mgr);
   for (int i = 0; i < num_blocks; i++)
