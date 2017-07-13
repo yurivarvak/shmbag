@@ -1,6 +1,7 @@
 
 #include <string>
 #include <chrono>
+#include <thread>
 #include <iostream>
 #include <stdlib.h>
 #include "shmbag.h"
@@ -58,6 +59,9 @@ bool simple_test()
   ret = shmbag_mgr_item_set_id(mgr, item2, s.c_str()); assert(ret == 0);
   print_item(item2, "set item name");
   ret = shmbag_item_free(item2); assert(ret == 0);
+  item2 = shmbag_mgr_item_acquire_or_alloc(mgr, s.c_str(), 0); assert(item);
+  print_item(item2, "reopen renamed item");
+  ret = shmbag_item_free(item2); assert(ret == 0);
   ret = shmbag_mgr_close(mgr); assert(ret == 0);
   return true;
 }
@@ -83,16 +87,17 @@ void large_test()
   {
     string s = get_uuid(i);
     shmbag_item_t item = shmbag_mgr_item_acquire(mgr, s.c_str()); assert(item);
-    int ret = shmbag_mgr_item_realloc(mgr, item, num_blocks - i + 1); assert(ret == 0);
+    int ret = shmbag_mgr_item_realloc(mgr, item, (num_blocks - i) * 1 + 1); assert(ret == 0);
 	assert(!strcmp(shmbag_item_get_ptr(item), s.c_str()));
-    //shmbag_item_t item2 = shmbag_item_get(fname, shmbag_item_get_offset(item)); assert(item);
-    //ret = shmbag_item_free(item2); assert(ret == 0);
+    shmbag_item_t item2 = shmbag_item_get(fname, shmbag_item_get_offset(item)); assert(item);
+	assert(!strcmp(shmbag_item_get_ptr(item2), s.c_str()));
+    ret = shmbag_item_free(item2); assert(ret == 0);
     ret = shmbag_item_free(item); assert(ret == 0);
   }
   int ret = shmbag_mgr_close(mgr); assert(ret == 0);
   auto end = chrono::system_clock::now();
   elapsed_seconds = end - mid;
-  cout << " done " << elapsed_seconds.count() << "s.\n";
+  cout << " realloc " << elapsed_seconds.count() << "s.\n";
 }
 
 void concurrent_test()

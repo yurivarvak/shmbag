@@ -18,6 +18,8 @@
 #include <limits.h>
 #include <shmbag.h>
 
+#include <iostream>  // for debug
+
 using namespace std;
 
 // UUID stuff
@@ -95,7 +97,7 @@ static page_t s2p(int64_t size)
   int64_t p = size / PAGESIZE;
   if (size % PAGESIZE)
     p++;
-  assert(p < UINT_MAX);
+  assert(p < INT_MAX);
   return (page_t)p;
 } 
 
@@ -107,6 +109,21 @@ static int64_t p2s(page_t pages)
 static int64_t alignsize(int64_t size)
 {
   return p2s(s2p(size));
+}
+
+static mapped_region shmapabs(const file_mapping *file, int64_t ofs, int64_t size)
+{
+  assert(file);
+  assert(ofs >= 0);
+  assert(size > 0);
+  assert(size < UINT_MAX);
+  return mapped_region(*file, read_write, (offset_t)ofs, size_t(size));
+}
+
+static mapped_region shmappage(const file_mapping *file, page_t addr, page_t n_pages = 1)
+{
+  assert(n_pages > 0);
+  return shmapabs(file, p2s(addr), p2s(n_pages));
 }
 
 struct shmblock
@@ -129,7 +146,7 @@ struct shmblock_header : public shmblock
 static void mgr_service_loop(shmbag_mgr_t mgr);
 static void mgr_unlink_item(shmbag_mgr_t mgr, page_t addr);
 static mapped_region *mapmemblock(shmbag_mgr_t mgr, int64_t ofs);
-static mapped_region *mapmemblock(file_mapping &shm_file, int64_t ofs, int64_t size = 0);
+static mapped_region *mapmemblock(const file_mapping *shm_file, int64_t ofs, int64_t size = 0);
 
 struct shmbag_item
 {
@@ -138,10 +155,10 @@ struct shmbag_item
   page_t        address;   // absolute offset in pages
 
   shmbag_item(shmbag_mgr_t mgr, page_t addr); // shmbag_mgr specific constructor
-  shmbag_item(file_mapping &shm_file, int64_t ofs) : owner(0), address(0)
+  shmbag_item(const file_mapping &shm_file, int64_t ofs) : owner(0), address(0)
   {
     assert(ofs % PAGESIZE == 0);
-    memregion = mapmemblock(shm_file, ofs);
+    memregion = mapmemblock(&shm_file, ofs);
   }
   ~shmbag_item()
   {
@@ -161,7 +178,7 @@ struct shmbag_item
 
   int64_t get_offset()
   {
-    return (owner ? address : get_header()->address) * PAGESIZE;
+    return p2s(owner ? address : get_header()->address);
   }
   UniIdT get_id()
   {
@@ -173,9 +190,8 @@ struct shmbag_item
   }
   int64_t get_capacity()
   {
-    int64_t cap = get_header()->capacity;
-    assert(cap > 0);
-    return cap * PAGESIZE - sizeof(shmblock_header);
+    assert(get_header()->capacity > 0);
+    return p2s(get_header()->capacity) - sizeof(shmblock_header);
   }
   char *get_ptr()
   {
@@ -224,7 +240,11 @@ private:
     if (memregion)
       return;
     assert(owner && address);
-    memregion = mapmemblock(owner, address * PAGESIZE);
+    memregion = mapmemblock(owner, p2s(address));
+	auto hdr = get_header();
+	assert(hdr->address == address);
+	assert(hdr->capacity > 0);
+	assert(hdr->size >= 0);
   }
 };
 
@@ -261,10 +281,12 @@ struct shmdevice
   {
     if (incr == 0)
       return true;
+	const int64_t MB4 = 4 * 1024 * 1024;
+	incr = alignsize(incr > MB4 ? incr : MB4);
     unmapfile();
     fstream f(mapped_file, ios::out | ios::binary | ios::in);
 	assert(!f.fail());
-    f.seekp(alignsize(incr), ios::end) << '\0';
+    f.seekp(incr, ios::end) << '\0';
     f.close();
     mapfile();
     psize += s2p(incr);
@@ -326,13 +348,13 @@ struct control_header
 
 static unsigned initial_bag_block_capacity()
 {
-  return 2 * 1024;  // enough capacity for 16K blocks
+  return 2 * 1024;  // enough capacity for nK blocks
 }
 static page_t initial_bag_size()
 {
   const unsigned num_blocks = initial_bag_block_capacity();
   const unsigned pages_per_block = 1;
-  return s2p(num_blocks * sizeof(shmblock)) + num_blocks * pages_per_block;
+  return s2p((int64_t)num_blocks * sizeof(shmblock)) + num_blocks * pages_per_block;
 }
 
 typedef function<void()> func;
@@ -367,8 +389,8 @@ struct shmbag_mgr
       device.resize(sz, true);
       int64_t tblsz = (int64_t)initial_bag_block_capacity() * sizeof(shmblock);
       shfile_ptr shf = device.get_file();
-      mapped_region init(*shf->file, read_write, 0, tblsz + sizeof(control_header));
-      control_header *hdr = (control_header *)init.get_address();
+	  auto h = shmapabs(shf->file, 0, tblsz + sizeof(control_header));
+      control_header *hdr = (control_header *)h.get_address();
       hdr->table_cap = initial_bag_block_capacity();
       memset(hdr + 1, 0, tblsz);
     }
@@ -377,12 +399,12 @@ struct shmbag_mgr
     int tblcap = 0;
     shfile_ptr shf = device.get_file();
     { // get control table size
-      mapped_region init(*shf->file, read_write, 0, sizeof(control_header));
-      tblcap = ((control_header *)init.get_address())->table_cap;
+      auto h = shmappage(shf->file, 0);
+      tblcap = ((control_header *)h.get_address())->table_cap;
     }
     assert(tblcap > 0);
     int64_t sz = (int64_t)tblcap * sizeof(shmblock) + sizeof(control_header);
-    control_table = new mapped_region(*shf->file, read_write, 0, sz);
+    control_table = new mapped_region(shmapabs(shf->file, 0, sz));
 
     // read memory blocks
     for (int i = 0; i < control_table_cap(); i++)
@@ -418,7 +440,7 @@ struct shmbag_mgr
     return i == id_to_addr.end() ? 0 : construct_item(i->second);
   }
   
-  page_t move_block(page_t source, page_t target)
+  int move_block(page_t source, page_t target) // returns number of pages copied
   {
     assert(source && target);
 	if (source == target)
@@ -431,8 +453,8 @@ struct shmbag_mgr
 	assert(shmblk);
 	
 	shfile_ptr shf = device.get_file();
-	mapped_region src(*shf->file, read_write, p2s(source), p2s(shmblk->capacity));
-	mapped_region tgt(*shf->file, read_write, p2s(target), p2s(shmblk->capacity));
+	auto src = shmappage(shf->file, source, shmblk->capacity);
+	auto tgt = shmappage(shf->file, target, shmblk->capacity);
 	memmove(tgt.get_address(), src.get_address(), p2s(shmblk->capacity));
 	memset(src.get_address(), 0, sizeof(shmblock_header));
 	
@@ -443,7 +465,7 @@ struct shmbag_mgr
 	if (!btkUniIdIsNull(&shmblk->id)) // if id is not null - update index
       id_to_addr[shmblk->id] = shmblk->address;
   
-    return shmblk->capacity;
+    return (int)shmblk->capacity;
   }
 
   page_t alloc(const UniIdT &id, int64_t size)
@@ -465,8 +487,11 @@ struct shmbag_mgr
 	page_t av_cap = device.psize - fs_addr;
 	
 	if (av_cap < min_cap) // need to grow shmem file
+	{
+	  cout << "alloc: grow file from " << device.psize << " to " << device.psize + min_cap - av_cap << "\n";
 	  if (!device.grow(p2s(min_cap - av_cap)))
 	    return 0;
+	}
 	
 	page_t des_cap = av_cap / 3;
 	page_t cap = (size > 0 || min_cap > des_cap) ? min_cap : des_cap;
@@ -582,12 +607,19 @@ struct shmbag_mgr
 	  if (blk)  // if not - address not longer valid 
 	  { // truncate capacity to match the size
 	    shfile_ptr shf = device.get_file();
-	    mapped_region h(*shf->file, read_write, addr, sizeof(shmblock_header));
+	    auto h = shmappage(shf->file, addr);
 	    shmblock_header *hdr = (shmblock_header *)h.get_address();
 	    page_t new_cap = s2p(hdr->size + sizeof(shmblock_header));
 	    assert(hdr->capacity >= new_cap);
 	    if (hdr->capacity > new_cap)
+		{
+		  shmblock query = { NULL_UNIID_T, addr, 0 };
+          auto b = blocks.find(query);
+          assert(b != blocks.end());
+		  blocks.erase(b);
 		  blk->capacity = hdr->capacity = new_cap;
+		  blocks.insert(*blk);
+		}
 	  }
 	}
   }
@@ -616,8 +648,8 @@ struct shmbag_mgr
 
     shfile_ptr shf = device.get_file();
 	delete control_table;
-	control_table = new mapped_region(*shf->file, read_write, 0, p2s(first_blk->address + first_blk->capacity));
-	mapped_region copy(*shf->file, read_write, p2s(free_addr), p2s(first_blk->capacity));
+	control_table = new mapped_region(shmappage(shf->file, 0, first_blk->address + first_blk->capacity));
+	auto copy = shmappage(shf->file, free_addr, first_blk->capacity);
 	shmblock *old_blk = (shmblock *)((char *)control_table->get_address() + p2s(first_blk->address));
 	shmblock *new_blk = (shmblock *)copy.get_address();
 	memcpy(new_blk, old_blk, p2s(first_blk->capacity));
@@ -646,10 +678,10 @@ struct shmbag_mgr
   shmblock *get_blk_w_addr(page_t addr, int start_idx = -1)
   {
     if (start_idx < 0 && addr)
-	{
+	{ // looking for real address & would like to estimate location
       shmblock query = { NULL_UNIID_T, addr, 0 };
       auto blk = blocks.find(query);
-      if (blk != blocks.end())
+      if (blk == blocks.end())
 	    return 0;
 	  start_idx = distance(blocks.begin(), blk);
     }
@@ -675,20 +707,12 @@ struct shmbag_mgr
   void init_block_header(page_t addr, const UniIdT &id, page_t cap, int64_t size)
   {
     shfile_ptr shf = device.get_file();
-    mapped_region hdrreg(*shf->file, read_write, addr*PAGESIZE, sizeof(shmblock_header));
-    shmblock_header *hdr = (shmblock_header *)hdrreg.get_address();
+	auto h = shmappage(shf->file, addr);
+    shmblock_header *hdr = (shmblock_header *)h.get_address();
     hdr->address = addr;
     hdr->capacity = cap;
     hdr->id = id;
     hdr->size = size;
-  }
-
-  void get_block_header(page_t addr, shmblock_header &header)
-  {
-    shfile_ptr shf = device.get_file();
-    mapped_region hdrreg(*shf->file, read_write, addr*PAGESIZE, sizeof(shmblock_header));
-    memcpy(&header, hdrreg.get_address(), sizeof(shmblock_header));
-    assert(header.address == addr);
   }
   
   // maintenance stuff
@@ -731,27 +755,30 @@ struct shmbag_mgr
 	  return;
 	for (int i = 0; i < 1024; i++)
 	{
-	  auto blk = blocks.lower_bound({ NULL_UNIID_T, last_compact_addr, 0 });
+	  auto blk = blocks.upper_bound({ NULL_UNIID_T, last_compact_addr, 0 });
 	  if (blk == blocks.end())
 	  {
 	    last_compact_addr = 0;
 	    break;
   	  }
 	  last_compact_addr = blk->address;
-	  if (inflight_items.find(blk->address) == inflight_items.end())
+	  if (blk == blocks.begin()) // first item
 	  {
-	    page_t cap = blk->capacity;
-	    if (blk == blocks.begin()) // first item
-		  i += move_block(last_compact_addr, s2p((int64_t)control_table_cap() * sizeof(shmblock) + sizeof(control_header)));
-		else if (++blk != blocks.end())  // shift next item to the end of the current one
-		  i += move_block(blk->address, last_compact_addr + cap);
+	    if (inflight_items.find(blk->address) == inflight_items.end())
+		  i += move_block(blk->address, s2p((int64_t)control_table_cap() * sizeof(shmblock) + sizeof(control_header)));
+	  }
+	  auto nx = next(blk);
+	  if (nx != blocks.end())
+	  { // shift next item to the end of the current one
+	    if (inflight_items.find(nx->address) == inflight_items.end())
+		  i += move_block(nx->address, blk->address + blk->capacity);
 	  }
 	}
   }
   
   void do_maint_devsize()
   {
-    if (blocks.empty() || get_free_space_addr())
+    if (blocks.empty())
 	  return;
 	  
     const int64_t MB = 1024 * 1024;
@@ -759,19 +786,29 @@ struct shmbag_mgr
     const int64_t desired_size = 4 * GB;
 	int64_t total = p2s(device.psize) - (control_table_cap() * sizeof(shmblock)) - sizeof(control_header);
 	int64_t est_free = total;
-	int num_blks = blocks.size();
-	if (num_blks < 100)  // calc used space
+
+	if (blocks.size() < 100)  // calc used space
 	  for (auto b : blocks) est_free -= p2s(b.capacity);
 	else { // estimate free space
-	  est_free = 0;
+	  page_t paddr = get_free_space_addr();
+	  est_free = p2s(device.psize - paddr);
 	  auto blk = blocks.rbegin();
 	  for (int i = 0; i < 20 && blk != blocks.rend(); i++, blk++)
-	    est_free += p2s(blk->capacity);
+	  {
+	    assert(paddr >= blk->address + blk->capacity);
+	    est_free += p2s(paddr - blk->address - blk->capacity);
+		paddr = blk->address;
+	  }
 	}
 	assert(est_free >= 0);
-	int ratio = est_free ? total / est_free : 1000;
+	int ratio = (int)(est_free ? total / est_free : 1000);
 	if (ratio > 10 || (total < desired_size && inflight_items.empty() && ratio > 4))  // loads of 90% or 75%
-	  device.grow(1 * MB);
+	{
+	  device.grow(4 * MB);
+	  //cout << "do_maint_devsize: grow total/est_free/inflight " << total << "/"<< est_free <<"/"<< inflight_items.empty() << "\n";
+	} /*
+	else
+	  cout << "do_maint_devsize: nogrow total/est_free/inflight " << total << est_free << inflight_items.empty() << "\n"; */
   }
 
   // make a request to service thread
@@ -790,24 +827,32 @@ shmbag_item::shmbag_item(shmbag_mgr_t mgr, page_t addr) : owner(mgr), address(ad
   assert(owner->service.get_id() == this_thread::get_id());
 }
 
-static mapped_region *mapmemblock(file_mapping &shm_file, int64_t ofs, int64_t size)
+static mapped_region *mapmemblock(const file_mapping *shm_file, int64_t ofs, int64_t size)
 {
   if (size <= 0)  // need to find out
   {
-    mapped_region hdrreg(shm_file, read_write, ofs, sizeof(shmblock_header));
-    shmblock_header *hdr = (shmblock_header *)hdrreg.get_address();
-    size = (int64_t)hdr->capacity * PAGESIZE;
+    auto h = shmapabs(shm_file, ofs, sizeof(shmblock_header));
+	size = p2s(((shmblock_header *)h.get_address())->capacity);
   }
-  return new mapped_region(shm_file, read_write, ofs, size);
+  return new mapped_region(shmapabs(shm_file, ofs, size));
 }
 
 static mapped_region *mapmemblock(shmbag_mgr_t mgr, int64_t ofs)
 {
-  shmblock query = { NULL_UNIID_T, s2p(ofs), 0 };
-  auto blk = mgr->blocks.find(query);
-  assert(blk != mgr->blocks.end());
+  page_t cap, addr = s2p(ofs);
+  atomic<bool> done(false);
+  func fn = [&]() { 
+    shmblock query = { NULL_UNIID_T, addr, 0 };
+    auto blk = mgr->blocks.find(query);
+	assert(blk != mgr->blocks.end());
+	cap = blk->capacity;
+	done = true; 
+  };
+  mgr->call(fn);
+  while (!done) this_thread::yield();
+  
   shfile_ptr shf = mgr->device.get_file();
-  return mapmemblock(*shf->file, ofs, p2s(blk->capacity));
+  return mapmemblock(shf->file, ofs, p2s(cap));
 }
 
 static void mgr_service_loop(shmbag_mgr_t mgr)
@@ -832,7 +877,7 @@ while (mgr->running) {
   {
     case 0: mgr->do_maint_slots(); break;
 	case 1: mgr->do_maint_blocks(); break;
-	case 2: mgr->do_maint_devsize(); // fallthrough
+	case 2: if (1) mgr->do_maint_devsize(); // fallthrough
 	default: maint_task = (maint_task < max_task) ? maint_task : 0;
   }
 }}
