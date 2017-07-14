@@ -913,9 +913,7 @@ struct shmbag_mgr
 	{
 	  device.grow(4 * MB);
 	  // cout << "do_maint_devsize: grow total/est_free/inflight " << total << "/"<< est_free <<"/"<< inflight_items.empty() << "\n";
-	} /*
-	else
-	  cout << "do_maint_devsize: nogrow total/est_free/inflight " << total << est_free << inflight_items.empty() << "\n"; */
+	}
   }
 
   // make a request to service thread
