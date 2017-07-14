@@ -3,12 +3,13 @@
 #include <fstream>
 #include <string>
 #include <memory>
-#include <map>
 #include <set>
+#include <map>
 #include <queue>
 #include <string>
 #include <condition_variable>
 #include <unordered_set>
+#include <unordered_map>
 #include <chrono>
 #include <mutex>
 #include <thread>
@@ -346,6 +347,217 @@ struct control_header
   int table_cap;
 };
 
+struct shmblock_index
+{
+  shmblock_index() : shmem(0) {}
+  ~shmblock_index() { addr_to_idx.clear(); addresses.clear(); id_to_addr.clear(); shmem = 0; }
+  
+  void set_table(void *table)
+  {
+    assert(!shmem);
+	assert(table);
+	shmem = table;
+	for (unsigned i = 0; i < table_capacity(); i++)
+	{
+	  shmblock *blk = blktable() + i;
+	  if (blk->address)
+	  {
+	    addr_to_idx[blk->address] = i;
+	    addresses.insert(blk->address);
+	    put_id(blk->address, blk->id);
+	  }
+	}
+	assert(addr_to_idx.size() == addresses.size() && addresses.size() >= id_to_addr.size());
+  }
+  
+  void update_table(void *table)
+  {
+    assert(shmem);
+	assert(table);
+	shmem = table;
+  }
+  
+  unsigned compact_table(unsigned idx, unsigned size)
+  {
+    if (addresses.size() == 0)
+	  return 0;
+    idx = idx < addresses.size() ? idx : 0;
+	shmblock *next = 0;
+	for (unsigned i = 0; i < size; i++)
+	{
+	  shmblock *cur = blktable() + idx;
+	  if (!cur->address || idx+1 < addresses.size())
+	  { // there is at least one more used slot
+	    if (!next || next == cur)
+	      next = cur + 1;
+	    while (!next->address) next++;  // find next used slot
+		
+		assert(!cur->address || addresses.find(cur->address) != addresses.end());
+		assert(addresses.find(next->address) != addresses.end());
+		page_t cur_addr = cur->address, next_addr = next->address;
+		if (cur_addr == 0 || cur_addr > next_addr)
+		{ // swap slots
+		  if (cur_addr)
+		    addr_to_idx[cur_addr] = next - blktable();
+		  addr_to_idx[next_addr] = idx;
+		  swap(*cur, *next);
+		}
+	  }
+	  if (++idx == addresses.size())
+	    break;
+	}
+	assert(addr_to_idx.size() == addresses.size() && addresses.size() >= id_to_addr.size());
+	return idx;
+  }
+
+  page_t block_addr_by_id(const UniIdT &id)
+  {
+    auto i = id_to_addr.find(id);
+    return i == id_to_addr.end() ? 0 : i->second;
+  }
+  shmblock *get_block(page_t addr)
+  {
+	if (addr) // looking for real address
+	{
+	  auto i = addr_to_idx.find(addr);
+	  return i == addr_to_idx.end() ? 0 : blktable() + i->second;
+	  // return addr_to_idx.find(addr) != addr_to_idx.end() ? blktable() + addr_to_idx[addr] : 0;
+	}
+	if (table_capacity() == addresses.size()) // out of empty slots
+	  return 0;
+	for (unsigned i = addresses.size(); i < table_capacity(); i++)
+	  if (blktable()[i].address == 0)
+	    return blktable() + i;
+	for (unsigned i = 0; i < addresses.size(); i++)
+	  if (blktable()[i].address == 0)
+	    return blktable() + i;
+    return 0;
+  }
+  shmblock *first_block()  // return first allocated block
+  {
+    return addresses.begin() == addresses.end() ? 0 : get_block(*addresses.begin());
+  }
+  shmblock *last_block()  // return last allocated block
+  {
+    return addresses.rbegin() == addresses.rend() ? 0 : get_block(*addresses.rbegin());
+  }
+  shmblock *next_block(page_t addr)  // next block with address that is larger than, not equal to
+  {
+    auto i = addresses.upper_bound(addr);
+	return i == addresses.end() ? 0 : get_block(*i);
+  }
+  unsigned num_blocks()  // number of allocated blocks
+  {
+    return addresses.size();
+  }
+  int64_t estimate_frag_space()
+  {
+    page_t frag_pages = 0;
+	auto cur = addresses.rbegin();
+	for (int i = 0; i < 1000 && cur != addresses.rend(); i++, cur++)
+	{
+	  auto nx = next(cur);
+	  if (nx == addresses.rend())
+	    break;
+	  page_t cap = get_block(*nx)->capacity;
+	  assert(*cur >= *nx + cap);
+	  frag_pages += *cur - *nx - cap;
+	}
+	return p2s(frag_pages);
+  }
+  pair<page_t, page_t> find_free_block(page_t size)
+  {
+	for (auto cur = addresses.rbegin(); cur != addresses.rend(); cur++)
+	{
+	  auto nx = next(cur);
+	  if (nx == addresses.rend())
+	    break;
+	  page_t pcap = get_block(*nx)->capacity;
+	  assert(*cur >= *nx + pcap);
+	  page_t fcap = *cur - *nx - pcap;
+	  if (fcap >= size)
+	    return make_pair(*nx + pcap, fcap);
+	}
+	return make_pair(0, 0);  // not found
+  }
+  
+  void change_id(page_t addr, const UniIdT &new_id)
+  {
+    assert(addr);
+	auto blk = get_block(addr);
+	assert(blk);
+    if (!btkUniIdIsNull(&blk->id))
+	  id_to_addr.erase(blk->id);
+	blk->id = new_id;
+	put_id(addr, new_id);
+	assert(addr_to_idx.size() == addresses.size() && addresses.size() >= id_to_addr.size());
+  }
+  void add_block(shmblock *blk)
+  {
+    assert(blk >= blktable());
+	assert(blk->address);
+	assert(addr_to_idx.find(blk->address) == addr_to_idx.end());
+	assert(addresses.find(blk->address) == addresses.end());
+	unsigned idx = blk - blktable();
+	addr_to_idx[blk->address] = idx;
+	addresses.insert(blk->address);
+	put_id(blk->address, blk->id);
+	assert(addr_to_idx.size() == addresses.size() && addresses.size() >= id_to_addr.size());
+  }
+  void move_block(page_t old_addr, page_t new_addr)
+  {
+    assert(old_addr && new_addr);
+	assert(addr_to_idx.find(old_addr) != addr_to_idx.end());
+	assert(addr_to_idx.find(new_addr) == addr_to_idx.end());
+	assert(addresses.find(old_addr) != addresses.end());
+	assert(addresses.find(new_addr) == addresses.end());
+	auto blk = get_block(old_addr);
+	blk->address = new_addr;
+	addr_to_idx[new_addr] = addr_to_idx[old_addr];
+	addr_to_idx.erase(old_addr);
+	addresses.erase(old_addr);
+	addresses.insert(new_addr);
+	put_id(new_addr, blk->id);
+	assert(addr_to_idx.size() == addresses.size() && addresses.size() >= id_to_addr.size());
+  }
+  void free_block(page_t addr)
+  {
+    assert(addr);
+	auto blk = get_block(addr);
+	assert(blk);
+	if (!btkUniIdIsNull(&blk->id))
+	  id_to_addr.erase(blk->id);
+	addresses.erase(addr);
+	addr_to_idx.erase(addr);
+	memset(blk, 0, sizeof(shmblock));
+	assert(addr_to_idx.size() == addresses.size() && addresses.size() >= id_to_addr.size());
+  }
+private:
+  unordered_map<page_t, unsigned> addr_to_idx;
+  set<page_t>                     addresses;
+  map<UniIdT, page_t>             id_to_addr;
+  void                           *shmem;
+  
+  shmblock *blktable()
+  {
+    assert(shmem);
+    return (shmblock *)((control_header *)shmem + 1);
+  }
+  unsigned table_capacity()
+  {
+    assert(shmem);
+    int cap = ((control_header *)shmem)->table_cap;
+	assert(cap > 0);
+	return (unsigned)cap;
+  }
+  void put_id(page_t addr, const UniIdT &id)
+  {
+    assert(addr);
+    if (!btkUniIdIsNull(&id))
+	  id_to_addr[id] = addr;
+  }
+};
+
 static unsigned initial_bag_block_capacity()
 {
   return 2 * 1024;  // enough capacity for nK blocks
@@ -366,8 +578,7 @@ struct shmbag_mgr
   mapped_region *control_table; // map of control & allocation table
 
   // indexing data
-  set<shmblock>       blocks;  // managed memory blocks sorted by address
-  map<UniIdT, page_t> id_to_addr; // map of named blocks
+  shmblock_index blkindex;
 
   // concurrency control
   thread             service;  // service thread
@@ -406,13 +617,7 @@ struct shmbag_mgr
     int64_t sz = (int64_t)tblcap * sizeof(shmblock) + sizeof(control_header);
     control_table = new mapped_region(shmapabs(shf->file, 0, sz));
 
-    // read memory blocks
-    for (int i = 0; i < control_table_cap(); i++)
-      if (get_blks()[i].address)
-        blocks.insert(get_blks()[i]);
-    // update indexes
-    for (auto &b : blocks)
-      id_to_addr[b.id] = b.address;
+    blkindex.set_table(control_table->get_address()); // init indexing
 
     // start service
     service = thread(mgr_service_loop, this);
@@ -429,15 +634,14 @@ struct shmbag_mgr
     assert(control_table);
     delete control_table;
     control_table = 0;
-    blocks.clear();
 	return 0;
   }
 
   shmbag_item_t acquire_item(const UniIdT &id)
   {
     assert(service.get_id() == this_thread::get_id());
-    auto i = id_to_addr.find(id);
-    return i == id_to_addr.end() ? 0 : construct_item(i->second);
+	page_t addr = blkindex.block_addr_by_id(id);
+    return addr ? construct_item(addr) : 0;
   }
   
   int move_block(page_t source, page_t target) // returns number of pages copied
@@ -446,66 +650,63 @@ struct shmbag_mgr
 	if (source == target)
 	  return 0;
 	
-	shmblock query = { NULL_UNIID_T, source, 0 };
-    auto blk = blocks.find(query);
-    assert(blk != blocks.end());
-    shmblock *shmblk = get_blk_w_addr(source, distance(blocks.begin(), blk));
-	assert(shmblk);
-	
 	shfile_ptr shf = device.get_file();
-	auto src = shmappage(shf->file, source, shmblk->capacity);
-	auto tgt = shmappage(shf->file, target, shmblk->capacity);
-	memmove(tgt.get_address(), src.get_address(), p2s(shmblk->capacity));
-	memset(src.get_address(), 0, sizeof(shmblock_header));
-	
-	shmblk->address = ((shmblock *)tgt.get_address())->address = target;  // update address
-	
-	blocks.erase(blk);
-	blocks.insert(*shmblk);
-	if (!btkUniIdIsNull(&shmblk->id)) // if id is not null - update index
-      id_to_addr[shmblk->id] = shmblk->address;
-  
-    return (int)shmblk->capacity;
+	auto cap = blkindex.get_block(source)->capacity;
+	auto src = shmappage(shf->file, source, cap);
+	auto tgt = shmappage(shf->file, target, cap);
+	memmove(tgt.get_address(), src.get_address(), p2s(cap));
+	blkindex.move_block(source, target);
+	memset(src.get_address(), 0, sizeof(shmblock_header));  // reset old header
+	((shmblock *)tgt.get_address())->address = target;  // update address in header
+
+    return (int)cap;
   }
 
   page_t alloc(const UniIdT &id, int64_t size)
   {
     assert(service.get_id() == this_thread::get_id());
-    assert(id_to_addr.find(id) == id_to_addr.end());
 
-    shmblock *newblock = get_blk_w_addr(0, blocks.size()); // find free slot
+    shmblock *newblock = blkindex.get_block(0); // find free slot
 	if (!newblock)  // no available slots
 	{
 	  if (!extend_table_cap())  // can't extend - not possible to alloc
 	    return 0;
-	  newblock = get_blk_w_addr(0, blocks.size());
+	  newblock = blkindex.get_block(0);
 	  assert(newblock);
 	}
 	
 	page_t fs_addr = get_free_space_addr();
+	page_t addr = fs_addr;
 	page_t min_cap = (size > 0) ? s2p(size + sizeof(shmblock_header)) : 1;
 	page_t av_cap = device.psize - fs_addr;
 	
-	if (av_cap < min_cap) // need to grow shmem file
+	if (av_cap < min_cap) 
 	{
-	  cout << "alloc: grow file from " << device.psize << " to " << device.psize + min_cap - av_cap << "\n";
-	  if (!device.grow(p2s(min_cap - av_cap)))
-	    return 0;
+	  auto fb = blkindex.find_free_block(min_cap);
+	  if (fb.first == 0) // need to grow shmem file
+	  {
+	    // cout << "alloc: grow file from " << device.psize << " to " << device.psize + min_cap - av_cap << "\n";
+	    if (!device.grow(p2s(min_cap - av_cap)))
+	      return 0;
+	  }
+	  else
+	  {
+	    addr = fb.first;
+		av_cap = fb.second;
+	  }
 	}
+	else
+	  av_cap /= 16;  // number of concurrent writers multiplied by something, maybe 8?
 	
-	page_t des_cap = av_cap / 3;
-	page_t cap = (size > 0 || min_cap > des_cap) ? min_cap : des_cap;
+	page_t cap = (size > 0 || min_cap > av_cap) ? min_cap : av_cap;
 	
     newblock->id = id;
-    newblock->address = fs_addr;
+    newblock->address = addr;
     newblock->capacity = cap;
+	blkindex.add_block(newblock);
 
     // update block header
     init_block_header(newblock->address, newblock->id, newblock->capacity, 0);
-
-    blocks.insert(*newblock);
-    if (!btkUniIdIsNull(&id)) // record valid block id
-      id_to_addr[id] = newblock->address;
 
     return newblock->address;
   }
@@ -514,8 +715,8 @@ struct shmbag_mgr
   {
     assert(service.get_id() == this_thread::get_id());
     shmblock query = { NULL_UNIID_T, addr, 0 };
-    auto blk = blocks.find(query);
-    if (blk == blocks.end())
+    auto blk = blkindex.get_block(addr);
+    if (blk == 0)
       return 0; // addr not found
     page_t new_cap = s2p(new_size + sizeof(shmblock_header));
     if (blk->capacity >= new_cap) // no need to realloc
@@ -546,15 +747,7 @@ struct shmbag_mgr
 
   void free(page_t addr) // doesn't clear out block header
   {
-    shmblock query = { NULL_UNIID_T, addr, 0 };
-    auto blk = blocks.find(query);
-    assert(blk != blocks.end());
-    shmblock *shmblk = get_blk_w_addr(addr, distance(blocks.begin(), blk));
-    assert(shmblk);
-    if (!btkUniIdIsNull(&blk->id)) // if id is not null - remove from index
-      id_to_addr.erase(blk->id);
-    memset(shmblk, 0, sizeof(shmblock));
-    blocks.erase(blk);
+    blkindex.free_block(addr);
   }
 
   shmbag_item_t alloc_or_acquire(const UniIdT &id, int64_t size)
@@ -571,20 +764,8 @@ struct shmbag_mgr
   void set_item_id(shmbag_item_t item, const UniIdT &newid)
   {
     assert(service.get_id() == this_thread::get_id());
-    assert(id_to_addr.find(newid) == id_to_addr.end()); // make sure it isn't there yet
-    shmblock_header *hdr = item->get_header();
-    shmblock query = { NULL_UNIID_T, hdr->address, 0 };
-    auto blk = blocks.find(query);
-    assert(blk != blocks.end());
-    shmblock *shmblk = get_blk_w_addr(hdr->address, distance(blocks.begin(), blk));
-    assert(shmblk); // must be
-    if (!btkUniIdIsNull(&blk->id)) // if old id is not null - remove from index
-      id_to_addr.erase(blk->id);
-    blocks.erase(blk);
-    hdr->id = shmblk->id = newid;
-    blocks.insert(*shmblk);
-    if (!btkUniIdIsNull(&newid)) // if new id is not null - add to index
-      id_to_addr[newid] = hdr->address;
+	blkindex.change_id(item->get_header()->address, newid);
+	item->get_header()->id = newid;
   }
 
   shmbag_item_t construct_item(page_t addr)
@@ -603,7 +784,7 @@ struct shmbag_mgr
     inflight_items.erase(i);
 	if (inflight_items.find(addr) == inflight_items.end()) // last reference
 	{
-	  shmblock *blk = get_blk_w_addr(addr);
+	  shmblock *blk = blkindex.get_block(addr);
 	  if (blk)  // if not - address not longer valid 
 	  { // truncate capacity to match the size
 	    shfile_ptr shf = device.get_file();
@@ -612,14 +793,7 @@ struct shmbag_mgr
 	    page_t new_cap = s2p(hdr->size + sizeof(shmblock_header));
 	    assert(hdr->capacity >= new_cap);
 	    if (hdr->capacity > new_cap)
-		{
-		  shmblock query = { NULL_UNIID_T, addr, 0 };
-          auto b = blocks.find(query);
-          assert(b != blocks.end());
-		  blocks.erase(b);
 		  blk->capacity = hdr->capacity = new_cap;
-		  blocks.insert(*blk);
-		}
 	  }
 	}
   }
@@ -632,76 +806,45 @@ struct shmbag_mgr
   
   bool extend_table_cap()
   {
-    auto first_blk = blocks.begin();
-	if (first_blk->address == 0 ||
-	    inflight_items.find(first_blk->address) != inflight_items.end())
+    auto first_blk = blkindex.first_block();
+	if (first_blk == 0 || inflight_items.find(first_blk->address) != inflight_items.end())
 	  return false;
 
+	page_t fb_addr = first_blk->address, fb_cap = first_blk->capacity;
 	page_t free_addr = get_free_space_addr();
+	if (device.psize < free_addr + fb_cap) 
+	{
+	  auto fb = blkindex.find_free_block(fb_cap);
+	  if (fb.first == 0) // need to grow shmem file
+	  {
+	    // cout << "extend_table_cap: grow file from " << device.psize << " to " << free_addr + fb_cap << "\n";
+        if (!device.grow(p2s(free_addr + fb_cap - device.psize)))
+	      return false;
+	  }
+	  else
+	    free_addr = fb.first;
+	}
 	
-	if (device.psize < free_addr + first_blk->capacity) // need to grow shmem file
-      if (!device.grow(p2s(free_addr + first_blk->capacity - device.psize)))
-	    return false;
-	
-	int old_cap = control_table_cap();
-	int new_cap = old_cap + (int)(p2s(first_blk->capacity) / sizeof(shmblock));
+	move_block(fb_addr, free_addr);  // move first block to the end
 
-    shfile_ptr shf = device.get_file();
+    // remap control table & initialize additional table pages
+	shfile_ptr shf = device.get_file();
 	delete control_table;
-	control_table = new mapped_region(shmappage(shf->file, 0, first_blk->address + first_blk->capacity));
-	auto copy = shmappage(shf->file, free_addr, first_blk->capacity);
-	shmblock *old_blk = (shmblock *)((char *)control_table->get_address() + p2s(first_blk->address));
-	shmblock *new_blk = (shmblock *)copy.get_address();
-	memcpy(new_blk, old_blk, p2s(first_blk->capacity));
-	memset(old_blk, 0, p2s(first_blk->capacity));
-	
-	shmblock *blk_slot = get_blk_w_addr(first_blk->address, 0);
-	assert(blk_slot);
-	blk_slot->address = new_blk->address = free_addr;
-	
-	blocks.erase(first_blk);
-	blocks.insert(*new_blk);
-	if (!btkUniIdIsNull(&new_blk->id)) // if id is not null - update index
-      id_to_addr[new_blk->id] = new_blk->address;
-    
-	((control_header *)control_table->get_address())->table_cap = new_cap;
+	control_table = new mapped_region(shmappage(shf->file, 0, fb_addr + fb_cap));
+	char *ct = (char *)control_table->get_address();
+	((control_header *)ct)->table_cap = (int)((p2s(fb_addr + fb_cap) - sizeof(control_header)) / sizeof(shmblock));
+	memset(ct + p2s(fb_addr), 0, p2s(fb_cap));
+	blkindex.update_table(ct);
 	
 	return true;
   }
 
-  shmblock *get_blks()
-  {
-    assert(control_table);
-    return (shmblock *)((control_header *)control_table->get_address() + 1);
-  }
-
-  shmblock *get_blk_w_addr(page_t addr, int start_idx = -1)
-  {
-    if (start_idx < 0 && addr)
-	{ // looking for real address & would like to estimate location
-      shmblock query = { NULL_UNIID_T, addr, 0 };
-      auto blk = blocks.find(query);
-      if (blk == blocks.end())
-	    return 0;
-	  start_idx = distance(blocks.begin(), blk);
-    }
-	
-    start_idx = start_idx < 0 ? 0 : start_idx;
-    int table_max = control_table_cap();
-    int end_idx = table_max + start_idx;
-    assert((int64_t)table_max + start_idx <= INT_MAX); // just in case...
-    for (int i = start_idx; i < end_idx; i++)
-      if (get_blks()[i % table_max].address == addr)
-        return get_blks() + (i % table_max);
-    return 0; // not found
-  }
-
   page_t get_free_space_addr()
   {
-    if (blocks.empty())
-      return s2p((int64_t)control_table_cap() * sizeof(shmblock) + sizeof(control_header));
-    auto last = blocks.rbegin();
-    return last->address + last->capacity;
+    auto last = blkindex.last_block();
+	if (last)
+	  return last->address + last->capacity;
+    return s2p((int64_t)control_table_cap() * sizeof(shmblock) + sizeof(control_header));
   }
 
   void init_block_header(page_t addr, const UniIdT &id, page_t cap, int64_t size)
@@ -717,95 +860,59 @@ struct shmbag_mgr
   
   // maintenance stuff
   unsigned maint_slot_idx;
-  void do_maint_slots()
+  void do_maint_slots(int iter)
   {
-    if (blocks.empty())
-	  return;
-	  
-	if (control_table_cap() < blocks.size() * 2)  
+	if (control_table_cap() < blkindex.num_blocks() * 2)  
 	{ // capacity to be double current num blocks
-	  extend_table_cap();
+	  int i = 0;
+	  while (i++ < iter && control_table_cap() < blkindex.num_blocks() * 4 && extend_table_cap()) ;
 	  return;
 	}
 	
-	maint_slot_idx = (maint_slot_idx < blocks.size()) ? maint_slot_idx : 0;
-	shmblock *next = 0;
-	for (int i = 0; i < 1024; i++)
-	{
-	  shmblock *cur = get_blks() + maint_slot_idx;
-	  if (maint_slot_idx < blocks.size() - 1 || !cur->address)
-	  { // there is at least one more used slot
-	    if (!next || next == cur)
-	      next = cur + 1;
-	    while (!next->address) next++;  // find next used slot
-	  
-	    if (!cur->address || cur->address > next->address) 
-	      swap(*cur, *next);
-	  }
-      maint_slot_idx++;
-	  if (maint_slot_idx == blocks.size())
-	    break;
-	}
+	maint_slot_idx = blkindex.compact_table(maint_slot_idx, iter);
   }
   
   page_t last_compact_addr;
-  void do_maint_blocks()
+  void do_maint_blocks(int iter)
   {
-    if (blocks.empty())
-	  return;
-	for (int i = 0; i < 1024; i++)
+	for (int i = 0; i < iter; i++)
 	{
-	  auto blk = blocks.upper_bound({ NULL_UNIID_T, last_compact_addr, 0 });
-	  if (blk == blocks.end())
+	  shmblock *blk = blkindex.next_block(last_compact_addr);
+	  if (!blk)
 	  {
 	    last_compact_addr = 0;
+		do_maint_devsize();
 	    break;
   	  }
 	  last_compact_addr = blk->address;
-	  if (blk == blocks.begin()) // first item
+	  if (blk == blkindex.first_block()) // first item
 	  {
 	    if (inflight_items.find(blk->address) == inflight_items.end())
 		  i += move_block(blk->address, s2p((int64_t)control_table_cap() * sizeof(shmblock) + sizeof(control_header)));
+		blk = blkindex.first_block(); // it might have changed above
 	  }
-	  auto nx = next(blk);
-	  if (nx != blocks.end())
-	  { // shift next item to the end of the current one
-	    if (inflight_items.find(nx->address) == inflight_items.end())
-		  i += move_block(nx->address, blk->address + blk->capacity);
-	  }
+	  auto nx = blkindex.next_block(blk->address);
+	  // shift next item to the end of the current one
+	  if (nx && inflight_items.find(nx->address) == inflight_items.end())
+	    i += move_block(nx->address, blk->address + blk->capacity);
 	}
   }
   
   void do_maint_devsize()
   {
-    if (blocks.empty())
-	  return;
-	  
     const int64_t MB = 1024 * 1024;
 	const int64_t GB = 1024 * MB;
     const int64_t desired_size = 4 * GB;
-	int64_t total = p2s(device.psize) - (control_table_cap() * sizeof(shmblock)) - sizeof(control_header);
-	int64_t est_free = total;
+	int64_t ctab_size = (int64_t)control_table_cap() * sizeof(shmblock) + sizeof(control_header);
+	int64_t total = p2s(device.psize) - ctab_size;
+	int64_t est_free = total + ctab_size - p2s(get_free_space_addr()) + blkindex.estimate_frag_space();
 
-	if (blocks.size() < 100)  // calc used space
-	  for (auto b : blocks) est_free -= p2s(b.capacity);
-	else { // estimate free space
-	  page_t paddr = get_free_space_addr();
-	  est_free = p2s(device.psize - paddr);
-	  auto blk = blocks.rbegin();
-	  for (int i = 0; i < 20 && blk != blocks.rend(); i++, blk++)
-	  {
-	    assert(paddr >= blk->address + blk->capacity);
-	    est_free += p2s(paddr - blk->address - blk->capacity);
-		paddr = blk->address;
-	  }
-	}
 	assert(est_free >= 0);
 	int ratio = (int)(est_free ? total / est_free : 1000);
-	if (ratio > 10 || (total < desired_size && inflight_items.empty() && ratio > 4))  // loads of 90% or 75%
+	if (ratio > 10 || (total < desired_size && inflight_items.empty() && ratio > 5))  // loads of 90% or 80%
 	{
 	  device.grow(4 * MB);
-	  //cout << "do_maint_devsize: grow total/est_free/inflight " << total << "/"<< est_free <<"/"<< inflight_items.empty() << "\n";
+	  // cout << "do_maint_devsize: grow total/est_free/inflight " << total << "/"<< est_free <<"/"<< inflight_items.empty() << "\n";
 	} /*
 	else
 	  cout << "do_maint_devsize: nogrow total/est_free/inflight " << total << est_free << inflight_items.empty() << "\n"; */
@@ -841,13 +948,7 @@ static mapped_region *mapmemblock(shmbag_mgr_t mgr, int64_t ofs)
 {
   page_t cap, addr = s2p(ofs);
   atomic<bool> done(false);
-  func fn = [&]() { 
-    shmblock query = { NULL_UNIID_T, addr, 0 };
-    auto blk = mgr->blocks.find(query);
-	assert(blk != mgr->blocks.end());
-	cap = blk->capacity;
-	done = true; 
-  };
+  func fn = [&]() { cap = mgr->blkindex.get_block(addr)->capacity; done = true; };
   mgr->call(fn);
   while (!done) this_thread::yield();
   
@@ -860,8 +961,8 @@ static void mgr_service_loop(shmbag_mgr_t mgr)
   mgr->running = true;
   unique_lock<mutex> mlock(mgr->mux);
   bool timedout = false;
-  int maint_task = 0;
-  const int max_task = 2;
+  int n_runs = 0;
+
 while (mgr->running) {
   auto ttw = chrono::milliseconds(timedout ? 1 : 0);
   timedout = (mgr->signal.wait_for(mlock, ttw) == cv_status::timeout);
@@ -873,12 +974,12 @@ while (mgr->running) {
     mgr->requests.pop();
     req();
   }
-  switch (maint_task++)
+  if (timedout || ++n_runs > 1024)
   {
-    case 0: mgr->do_maint_slots(); break;
-	case 1: mgr->do_maint_blocks(); break;
-	case 2: if (1) mgr->do_maint_devsize(); // fallthrough
-	default: maint_task = (maint_task < max_task) ? maint_task : 0;
+    if (n_runs > 1024)
+	  n_runs = 0;
+    mgr->do_maint_slots(64);
+    mgr->do_maint_blocks(64);
   }
 }}
 
@@ -972,8 +1073,34 @@ int shmbag_mgr_item_set_id(shmbag_mgr_t mgr, shmbag_item_t item, const char *new
 /* consumer protocol */
 shmbag_item_t shmbag_item_get(const char *path, int64_t ofs)
 {
-  auto file = file_mapping(path, read_write);
-  return new shmbag_item(file, ofs);
+  static unordered_map<string, file_mapping *> files;
+  static mutex mux;
+  
+  string s(path);
+  lock_guard<mutex> g(mux);
+  auto fi = files.find(s);
+  
+  if (fi == files.end())
+  {
+    try {
+	  files[s] = new file_mapping(path, read_write);
+	} catch (...) { return 0; }
+	fi = files.find(s);
+	assert(fi != files.end());
+  }
+  
+  shmbag_item_t item;
+  try {
+    item = new shmbag_item(*fi->second, ofs);
+  } catch (...) {  // maybe file handle went bad
+    delete fi->second;
+	files.erase(s);
+	try {
+	  files[s] = new file_mapping(path, read_write);
+	  item = new shmbag_item(*files[s], ofs);
+	} catch (...) { return 0; }
+  }
+  return item;
 }
 
 /* common protocol */
